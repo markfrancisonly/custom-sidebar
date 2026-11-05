@@ -1,0 +1,576 @@
+From f54878ea6183fc948d7f4d18873d9abd3f27f75b Mon Sep 17 00:00:00 2001
+From: Mark Francis <markfrancisonly@gmail.com>
+Date: Thu, 5 Nov 2026 08:53:22 -0500
+Subject: [PATCH] Subscribe only to the tracked entities
+
+---
+ package.json                                  |   2 +-
+ src/classes/index.ts                          |  85 ++++++++++++--
+ src/constants/index.ts                        |   4 +-
+ src/utilities/index.ts                        |   5 +-
+ tests/03 - renderer-instance.test.ts          |  19 +++-
+ tests/08 - entities-change.test.ts            |  21 +++-
+ tests/10 - auto-init.test.ts                  |  20 ++--
+ tests/12 - entity-subscription-filter.test.ts | 106 ++++++++++++++++++
+ 8 files changed, 234 insertions(+), 28 deletions(-)
+ create mode 100644 tests/12 - entity-subscription-filter.test.ts
+
+diff --git a/package.json b/package.json
+index 69820fc..2d17bd2 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "home-assistant-javascript-templates",
+-  "version": "8.1.0-beta.1",
++  "version": "8.1.0-beta.1+entity-ids",
+   "description": "A JavaScript utility to render Home Assistant JavaScript templates",
+   "keywords": [
+     "home-assistant",
+diff --git a/src/classes/index.ts b/src/classes/index.ts
+index 5e36ac5..dd7e2c4 100644
+--- a/src/classes/index.ts
++++ b/src/classes/index.ts
+@@ -17,6 +17,7 @@ import {
+     CLIENT_SIDE_ENTITIES,
+     DEFAULT_REFS_VARIABLE_NAME,
+     EVENT,
++    REF_PREFIX,
+     STRICT_MODE
+ } from '@constants';
+ import { createScoppedFunctions } from '@utilities';
+@@ -72,6 +73,9 @@ export class HomeAssistantJavaScriptTemplatesRenderer {
+     private _scopped!: Scopped;
+ 
+     private _cancelSubscription?: CancelSubscription;
++    private _subscribedEntityIds = '';
++    private _entitySubscriptionSync: Promise<void> = Promise.resolve();
++    private _entitySubscriptionSyncScheduled = false;
+     private _panelUrlWatchCallbackBinded: () => void;
+     private _watchForLanguageChangeCallbackBinded: () => void;
+ 
+@@ -129,27 +133,83 @@ export class HomeAssistantJavaScriptTemplatesRenderer {
+         }
+         this._subscribed = true;
+         try {
+-            const hassConnection = await window.hassConnection;
+-            const cancelSubscription = await hassConnection.conn.subscribeMessage<SubscribeEntityEvent>(
+-                (event) => this._entityWatchCallback(event),
+-                {
+-                    type: EVENT.SUBSCRIBE_ENTITIES
+-                }
+-            );
+-            this._cancelSubscription = cancelSubscription;
++            await window.hassConnection;
++            await this._syncEntitySubscription();
+             return this;
+         } catch (error: unknown) {
+             this._subscribed = false;
+             throw error;
+         }
+-	}
++    }
+ 
+     private _stopWatchForEntitiesChange() {
+         if (!this._subscribed) {
+             throw new Error('You cannot call stop method without init being called');
+         }
+         this._subscribed = false;
+-        this._cancelSubscription!();
++        this._subscribedEntityIds = '';
++        this._cancelSubscription?.();
++        this._cancelSubscription = undefined;
++    }
++
++    // Only Home Assistant entities: refs and client-side variables never come from subscribe_entities
++    private _getTrackedEntityIds(): string[] {
++        return Array.from(this._subscriptions.keys())
++            .filter((id: string): boolean => id.includes('.') && !id.startsWith(`${REF_PREFIX}.`))
++            .sort();
++    }
++
++    private _syncEntitySubscription(): Promise<void> {
++        this._entitySubscriptionSync = this._entitySubscriptionSync
++            .catch(() => undefined)
++            .then(() => this._updateEntitySubscription());
++        return this._entitySubscriptionSync;
++    }
++
++    // Subscribing to an empty entity_ids list would mean every entity, so subscribe only when something is tracked
++    private async _updateEntitySubscription(): Promise<void> {
++        if (!this._subscribed) {
++            return;
++        }
++        const entityIds = this._getTrackedEntityIds();
++        const key = entityIds.join(',');
++        if (key === this._subscribedEntityIds) {
++            return;
++        }
++        const previousCancelSubscription = this._cancelSubscription;
++        let cancelSubscription: CancelSubscription | undefined;
++        if (entityIds.length) {
++            const hassConnection = await window.hassConnection;
++            cancelSubscription = await hassConnection.conn.subscribeMessage<SubscribeEntityEvent>(
++                (event) => this._entityWatchCallback(event),
++                {
++                    type: EVENT.SUBSCRIBE_ENTITIES,
++                    entity_ids: entityIds
++                }
++            );
++        }
++        if (!this._subscribed) {
++            cancelSubscription?.();
++            return;
++        }
++        this._cancelSubscription = cancelSubscription;
++        this._subscribedEntityIds = key;
++        previousCancelSubscription?.();
++    }
++
++    private _scheduleEntitySubscriptionSync(): void {
++        if (!this._subscribed || this._entitySubscriptionSyncScheduled) {
++            return;
++        }
++        this._entitySubscriptionSyncScheduled = true;
++        queueMicrotask(() => {
++            this._entitySubscriptionSyncScheduled = false;
++            this._syncEntitySubscription().catch((error: unknown) => {
++                if (this._throwWarnings) {
++                    console.warn(error);
++                }
++            });
++        });
+     }
+ 
+ 	private _entityWatchCallback(event: SubscribeEntityEvent) {        
+@@ -198,6 +258,7 @@ export class HomeAssistantJavaScriptTemplatesRenderer {
+                 );
+             }
+         });
++        this._scheduleEntitySubscriptionSync();
+     }
+ 
+     private _untrackTemplate(template: string, renderingFunction: RenderingFunction): void {
+@@ -216,6 +277,7 @@ export class HomeAssistantJavaScriptTemplatesRenderer {
+                 }
+             }
+         });
++        this._scheduleEntitySubscriptionSync();
+     }
+ 
+     public async init(): Promise<HomeAssistantJavaScriptTemplatesRenderer> {
+@@ -384,7 +446,8 @@ export class HomeAssistantJavaScriptTemplatesRenderer {
+             this._subscriptions.clear();
+         } else if(this._subscriptions.has(entityId)) {
+             this._subscriptions.delete(entityId);
+-        }   
++        }
++        this._scheduleEntitySubscriptionSync();
+     }
+ 
+     public get variables(): Vars {
+diff --git a/src/constants/index.ts b/src/constants/index.ts
+index ce68d13..6ce9663 100644
+--- a/src/constants/index.ts
++++ b/src/constants/index.ts
+@@ -25,4 +25,6 @@ export enum EVENT {
+ 
+ export const STRICT_MODE = '"use strict";';
+ 
+-export const DEFAULT_REFS_VARIABLE_NAME = 'refs';
+\ No newline at end of file
++export const DEFAULT_REFS_VARIABLE_NAME = 'refs';
++
++export const REF_PREFIX = 'ref';
+\ No newline at end of file
+diff --git a/src/utilities/index.ts b/src/utilities/index.ts
+index 74a986f..2d714be 100644
+--- a/src/utilities/index.ts
++++ b/src/utilities/index.ts
+@@ -18,7 +18,8 @@ import {
+     ENTITY_REGEXP,
+     STATE_VALUES,
+     ATTRIBUTES,
+-    CLIENT_SIDE_ENTITIES
++    CLIENT_SIDE_ENTITIES,
++    REF_PREFIX
+ } from '@constants';
+ 
+ const objectFromEntries = <T = unknown>(entries: [string, T][]): Record<string, T> => {
+@@ -32,7 +33,7 @@ const objectFromEntries = <T = unknown>(entries: [string, T][]): Record<string,
+ 
+ const hasDot = (entityId: string): boolean => entityId.includes('.');
+ 
+-const refProp = 'ref';
++const refProp = REF_PREFIX;
+ const refValue = 'value';
+ const refToJson = 'toJSON';
+ export const getRefId = (name: string): string => `${refProp}.${name}`;
+diff --git a/tests/03 - renderer-instance.test.ts b/tests/03 - renderer-instance.test.ts
+index 921c06c..07fa9ce 100644
+--- a/tests/03 - renderer-instance.test.ts	
++++ b/tests/03 - renderer-instance.test.ts	
+@@ -27,6 +27,7 @@ describe('promise instance', () => {
+             });
+             const compiler = new HomeAssistantJavaScriptTemplates(HOME_ASSISTANT_ELEMENT);
+             const renderer = await compiler.getRenderer();
++            renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
+             await expect(
+                 renderer.init()
+             ).rejects.toMatch('subscribeMessage error');
+@@ -63,16 +64,25 @@ describe('promise instance', () => {
+             expect(subscribeMessage).not.toHaveBeenCalled();
+         });
+ 
+-        it('hassConnection.conn.subscribeMessage should be called after init is called', async () => {
++        it('hassConnection.conn.subscribeMessage should be called with the tracked entities after init is called', async () => {
++            renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
+             await renderer.init();
+             expect(subscribeMessage).toHaveBeenCalledWith(
+                 expect.any(Function),
+                 {
+-                    type: EVENT.SUBSCRIBE_ENTITIES
++                    type: EVENT.SUBSCRIBE_ENTITIES,
++                    entity_ids: ['light.woonkamer_lamp']
+                 }
+             );
+         });
+ 
++        it('hassConnection.conn.subscribeMessage should not be called after init if no Home Assistant entity is tracked', async () => {
++            renderer.trackTemplate('user_name', jest.fn());
++            await renderer.init();
++            expect(renderer.subscribed).toBe(true);
++            expect(subscribeMessage).not.toHaveBeenCalled();
++        });
++
+         it('should throw an error if stop is called without calling init first', async () => {
+             expect(
+                 () => renderer.stop()
+@@ -81,6 +91,7 @@ describe('promise instance', () => {
+         });
+ 
+         it('should throw an error if init is called without calling stop first', async () => {
++            renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
+             await renderer.init();
+             expect(subscribeMessage).toHaveBeenCalledTimes(1);
+             await expect(
+@@ -90,6 +101,7 @@ describe('promise instance', () => {
+         });
+ 
+         it('should not throw an error if init is called after calling stop', async () => {
++            renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
+             await renderer.init();
+             renderer.stop();
+             expect(cancelSubscription).toHaveBeenCalledTimes(1);
+@@ -98,7 +110,8 @@ describe('promise instance', () => {
+                 2,
+                 expect.any(Function),
+                 {
+-                    type: EVENT.SUBSCRIBE_ENTITIES
++                    type: EVENT.SUBSCRIBE_ENTITIES,
++                    entity_ids: ['light.woonkamer_lamp']
+                 }
+             );
+         });
+diff --git a/tests/08 - entities-change.test.ts b/tests/08 - entities-change.test.ts
+index 0ecf54c..5d86355 100644
+--- a/tests/08 - entities-change.test.ts	
++++ b/tests/08 - entities-change.test.ts	
+@@ -7,6 +7,8 @@ import { EVENT } from '../src/constants';
+ import { HASS } from './constants';
+ 
+ const CUSTOM_EVENT = 'subscribe_entities';
++// The entity subscription follows the tracked entities asynchronously
++const flushSubscription = () => new Promise(process.nextTick);
+ const getSubscribeCustomEvent = (id: string) => {
+     return new CustomEvent(
+         CUSTOM_EVENT,
+@@ -270,6 +272,7 @@ describe('promise instance', () => {
+             expect(renderingFunction2).toHaveBeenNthCalledWith(1, 'off');
+             expect(renderingFunction3).toHaveBeenNthCalledWith(1, 'off');
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -294,14 +297,17 @@ describe('promise instance', () => {
+             );
+             expect(renderingFunction).toHaveBeenNthCalledWith(1, '0');
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('sensor.slaapkamer_temperatuur')
+             );
+             expect(renderingFunction).not.toHaveBeenCalledTimes(2);
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+             expect(renderingFunction).toHaveBeenNthCalledWith(2, '17.456');
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('sensor.slaapkamer_temperatuur')
+             );
+@@ -325,6 +331,7 @@ describe('promise instance', () => {
+             expect(renderingFunction1).toHaveBeenNthCalledWith(1, 'no');
+             expect(renderingFunction2).toHaveBeenNthCalledWith(1, 'off');
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -332,7 +339,7 @@ describe('promise instance', () => {
+             expect(renderingFunction2).toHaveBeenNthCalledWith(2, 'on');
+         });
+ 
+-        it('if the untrack function that trackTemplate returns is called then it should clean all the trackings for that template/rendering function', () => {
++        it('if the untrack function that trackTemplate returns is called then it should clean all the trackings for that template/rendering function', async () => {
+             const renderingFunction1 = jest.fn();
+             const renderingFunction2 = jest.fn();
+             const untrack1 = renderer.trackTemplate(
+@@ -352,6 +359,7 @@ describe('promise instance', () => {
+             expect(renderingFunction2).toHaveBeenNthCalledWith(1, 'off');
+             untrack1();
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -359,6 +367,7 @@ describe('promise instance', () => {
+             expect(renderingFunction2).toHaveBeenNthCalledWith(2, 'on');
+             untrack2();
+             hassClone.states['light.woonkamer_lamp'].state = 'off';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -366,7 +375,7 @@ describe('promise instance', () => {
+             expect(renderingFunction2).toHaveBeenCalledTimes(2);
+         });
+ 
+-        it('calling the untrack function that trackTemplate returns multiple times should not generate any errors even if the templates were already cleaned', () => {
++        it('calling the untrack function that trackTemplate returns multiple times should not generate any errors even if the templates were already cleaned', async () => {
+             const template1 = `
+                 if (is_state('light.woonkamer_lamp', 'on')) {
+                     return 'yes';
+@@ -388,6 +397,7 @@ describe('promise instance', () => {
+             expect(renderingFunction2_2).toHaveBeenNthCalledWith(1, false);
+             untrack1();
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -400,6 +410,7 @@ describe('promise instance', () => {
+             ).not.toThrow();
+             untrack2();
+             hassClone.states['light.woonkamer_lamp'].state = 'off';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -415,6 +426,7 @@ describe('promise instance', () => {
+             ).not.toThrow();
+             untrack1_2();
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -470,6 +482,7 @@ describe('promise instance', () => {
+             expect(renderingFunction1).toHaveBeenNthCalledWith(1, 'no');
+             expect(renderingFunction2).toHaveBeenNthCalledWith(1, 'off');
+             renderer.cleanTracked();
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
+@@ -487,9 +500,11 @@ describe('promise instance', () => {
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
+             hassClone.states['binary_sensor.koffiezetapparaat_verbonden'].state = 'off';
+             renderer.cleanTracked('binary_sensor.koffiezetapparaat_verbonden');
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('binary_sensor.koffiezetapparaat_verbonden')
+             );
+@@ -507,9 +522,11 @@ describe('promise instance', () => {
+             hassClone.states['light.woonkamer_lamp'].state = 'on';
+             hassClone.states['binary_sensor.koffiezetapparaat_verbonden'].state = 'off';
+             renderer.cleanTracked('light.eetkamer_lampje');
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('light.woonkamer_lamp')
+             );
++            await flushSubscription();
+             window.dispatchEvent(
+                 getSubscribeCustomEvent('binary_sensor.koffiezetapparaat_verbonden')
+             );
+diff --git a/tests/10 - auto-init.test.ts b/tests/10 - auto-init.test.ts
+index 6b11ffb..e4ba312 100644
+--- a/tests/10 - auto-init.test.ts	
++++ b/tests/10 - auto-init.test.ts	
+@@ -24,33 +24,37 @@ describe('autoInit', () => {
+         await new Promise(process.nextTick);
+     });
+ 
+-    it('hassConnection.conn.subscribeMessage should be called automatically if autoInit is true', () => {
++    it('hassConnection.conn.subscribeMessage should be called automatically once an entity is tracked if autoInit is true', async () => {
+         expect(renderer.subscribed).toBe(true);
++        expect(subscribeMessage).not.toHaveBeenCalled();
++        renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
++        await new Promise(process.nextTick);
+         expect(subscribeMessage).toHaveBeenCalledWith(
+             expect.any(Function),
+             {
+-                type: EVENT.SUBSCRIBE_ENTITIES
++                type: EVENT.SUBSCRIBE_ENTITIES,
++                entity_ids: ['light.woonkamer_lamp']
+             }
+         );
+     });
+ 
+     it('should throw an error if init is called with the autoInit option set without calling stop first', async () => {
+-        expect(subscribeMessage).toHaveBeenCalledTimes(1);
+         await expect(
+             renderer.init()
+         ).rejects.toThrow('You cannot call init method consecutively or call it if you used the autoInit option, call stop first');
+-        expect(subscribeMessage).not.toHaveBeenCalledTimes(2);
++        expect(subscribeMessage).not.toHaveBeenCalled();
+     });
+ 
+     it('should allow to call the init method if stop was called first', async () => {
+-        expect(subscribeMessage).toHaveBeenCalledTimes(1);
+         renderer.stop();
++        renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
+         await renderer.init();
+-        expect(subscribeMessage).toHaveBeenNthCalledWith(
+-            2,
++        expect(subscribeMessage).toHaveBeenCalledTimes(1);
++        expect(subscribeMessage).toHaveBeenCalledWith(
+             expect.any(Function),
+             {
+-                type: EVENT.SUBSCRIBE_ENTITIES
++                type: EVENT.SUBSCRIBE_ENTITIES,
++                entity_ids: ['light.woonkamer_lamp']
+             }
+         );
+     });
+diff --git a/tests/12 - entity-subscription-filter.test.ts b/tests/12 - entity-subscription-filter.test.ts
+new file mode 100644
+index 0000000..8a53c2e
+--- /dev/null
++++ b/tests/12 - entity-subscription-filter.test.ts	
+@@ -0,0 +1,106 @@
++import {
++    HomeAssistantJavaScriptTemplates,
++    HomeAssistantJavaScriptTemplatesRenderer
++} from '../src/classes';
++import { HOME_ASSISTANT_ELEMENT } from './constants';
++import { EVENT } from '../src/constants';
++
++const flushSubscription = () => new Promise(process.nextTick);
++
++describe('entity subscription filter', () => {
++
++    let renderer: HomeAssistantJavaScriptTemplatesRenderer;
++    let cancelSubscriptions: jest.Mock[];
++    let subscribeMessage: jest.Mock;
++
++    beforeEach(async () => {
++        cancelSubscriptions = [];
++        subscribeMessage = jest.fn(() => {
++            const cancelSubscription = jest.fn();
++            cancelSubscriptions.push(cancelSubscription);
++            return Promise.resolve(cancelSubscription);
++        });
++        window.hassConnection = Promise.resolve({
++            conn: {
++                subscribeMessage
++            }
++        });
++        const compiler = new HomeAssistantJavaScriptTemplates(HOME_ASSISTANT_ELEMENT);
++        renderer = await compiler.getRenderer();
++    });
++
++    afterEach(() => {
++        renderer.cleanTracked();
++    });
++
++    it('should subscribe only to Home Assistant entities, without refs or client-side variables', async () => {
++        renderer.trackTemplate(
++            `
++                const test = ref('test');
++                return panel_url + lang + test.value + states('light.woonkamer_lamp');
++            `,
++            jest.fn()
++        );
++        await renderer.init();
++        expect(subscribeMessage).toHaveBeenCalledTimes(1);
++        expect(subscribeMessage).toHaveBeenCalledWith(
++            expect.any(Function),
++            {
++                type: EVENT.SUBSCRIBE_ENTITIES,
++                entity_ids: ['light.woonkamer_lamp']
++            }
++        );
++    });
++
++    it('should resubscribe once when templates track new entities and cancel the previous subscription afterwards', async () => {
++        renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
++        await renderer.init();
++        renderer.trackTemplate('states("sensor.slaapkamer_temperatuur")', jest.fn());
++        renderer.trackTemplate('states("binary_sensor.koffiezetapparaat_aan")', jest.fn());
++        await flushSubscription();
++        expect(subscribeMessage).toHaveBeenCalledTimes(2);
++        expect(subscribeMessage).toHaveBeenNthCalledWith(
++            2,
++            expect.any(Function),
++            {
++                type: EVENT.SUBSCRIBE_ENTITIES,
++                entity_ids: [
++                    'binary_sensor.koffiezetapparaat_aan',
++                    'light.woonkamer_lamp',
++                    'sensor.slaapkamer_temperatuur'
++                ]
++            }
++        );
++        expect(cancelSubscriptions[0]).toHaveBeenCalledTimes(1);
++        expect(cancelSubscriptions[1]).not.toHaveBeenCalled();
++    });
++
++    it('should not resubscribe when the tracked entities do not change', async () => {
++        const template = 'states("light.woonkamer_lamp")';
++        renderer.trackTemplate(template, jest.fn());
++        await renderer.init();
++        renderer.trackTemplate(template, jest.fn());
++        await flushSubscription();
++        expect(subscribeMessage).toHaveBeenCalledTimes(1);
++    });
++
++    it('should cancel the subscription when no Home Assistant entity is tracked anymore', async () => {
++        const untrack = renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
++        await renderer.init();
++        untrack();
++        await flushSubscription();
++        expect(subscribeMessage).toHaveBeenCalledTimes(1);
++        expect(cancelSubscriptions[0]).toHaveBeenCalledTimes(1);
++    });
++
++    it('should cancel the subscription when stop is called', async () => {
++        renderer.trackTemplate('states("light.woonkamer_lamp")', jest.fn());
++        await renderer.init();
++        renderer.stop();
++        expect(cancelSubscriptions[0]).toHaveBeenCalledTimes(1);
++        renderer.trackTemplate('states("sensor.slaapkamer_temperatuur")', jest.fn());
++        await flushSubscription();
++        expect(subscribeMessage).toHaveBeenCalledTimes(1);
++    });
++
++});
+-- 
+2.43.0
+
